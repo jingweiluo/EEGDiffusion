@@ -323,7 +323,7 @@ if __name__ == "__main__":
     # plot_cwt_trials(X_cwt, trials_to_plot)
     
     # 功能3：对比真实数据与生成数据t-sne
-    from t-sne import compare_generated_with_real_tsne
+    from tsne import compare_generated_with_real_tsne
     generated_data = np.load('generated_data/generated_eeg_20trials.npy')
     real_data, _ = load_eeg_data()
     real_data_sub1 = real_data[:20, :, :]
