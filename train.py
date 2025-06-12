@@ -8,6 +8,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @dataclass
 class TrainingConfig:
+    # 类别总数
+    num_classes = 23
     # 图像尺寸
     image_size = (64, 64)
     # 训练批次大小
@@ -93,6 +95,9 @@ model = UNet2DModel(
         "UpBlock2D",
         "UpBlock2D",
     ),
+    class_embed_type="timestep",        # 或 "projection"
+    num_class_embeds=config.num_classes,  # 类别总数，如 23
+    dropout = 0.5
 )
 
 
@@ -102,9 +107,10 @@ model = UNet2DModel(
 import os
 from pathlib import Path
 from tqdm.auto import tqdm
+from tqdm import trange
 
 from accelerate import Accelerator
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 import torch.nn.functional as F
 
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -114,7 +120,8 @@ from diffusers import DDPMScheduler
 from huggingface_hub import create_repo, upload_folder
 
 noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-train_dataloader = DataLoader(X_tf_resize_norm, batch_size=config.train_batch_size, shuffle=True)
+dataset = TensorDataset(X_tf_resize_norm, y)
+train_dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 lr_scheduler = get_cosine_schedule_with_warmup(
     optimizer=optimizer,
@@ -122,34 +129,53 @@ lr_scheduler = get_cosine_schedule_with_warmup(
     num_training_steps=(len(train_dataloader) * config.num_epochs),
 )
 
-def evaluate(config, epoch, pipeline):
-    # 从随机噪声中生成一些图像（这是反向扩散过程）。
-    # 默认的管道输出类型是 `List[torch.Tensor]`
-    # 取sample_channel来展示
-    # print("生成图像......")
+@torch.no_grad()
+def evaluate(config, epoch, model_dir):
+    """
+    手动从 model_dir 加载 UNet 和 Scheduler，并做反向扩散采样。
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    images = pipeline(
-        batch_size=config.eval_batch_size,
-        generator=torch.Generator(device=device).manual_seed(config.seed),  # 使用单独的 torch 生成器来避免回绕主训练循环的随机状态
-        output_type="np.array",
-    ).images
+    # 1. 加载 UNet 和 scheduler
+    unet = UNet2DModel.from_pretrained(model_dir).to(device)
+    scheduler = DDPMScheduler.from_pretrained(model_dir)
+    unet.eval()
 
-    print("生成图像维度：", images.shape)
-    # (batch, height, width, channel)
-    images_transpose = images.transpose(0,3,1,2) # N,C,F,T
+    # 2. 准备固定标签（示例：全 3 类）
+    batch_size = config.eval_batch_size
+    class_value = 3
+    eval_labels = torch.full(
+        (batch_size,),
+        fill_value=class_value,
+        device=device,
+        dtype=torch.int64
+    )
 
-    plot_tf_trials(images_transpose, list(range(config.eval_batch_size)))
+    # 3. 随机噪声初始化
+    shape = (batch_size, unet.config.in_channels, *unet.config.sample_size)
+    imgs = torch.randn(shape, device=device)
 
-    # # 将生成的eval_batch_size个图像拼接成一张大图
-    # fig, ax = plt.subplots(2, 10, figsize=(20, 4))
-    # for i in range(2):
-    #     for j in range(10):
-    #         ax[i, j].imshow(images[i * 10 + j, :, :, sample_channel], aspect='auto')
-    #         ax[i, j].axis("off")
-    #         ax[i, j].set_title(f"Image {i * 10 + j}")
+    # 4. 反向扩散循环
+    for t in trange(len(scheduler.timesteps), desc=f"Sampling epoch {epoch}"):
+        timestep = scheduler.timesteps[t]
 
-    # plt.savefig(f"figs/{epoch:04d}.png", dpi=400)
-    # plt.close()
+        # UNet 预测噪声残差
+        noise_pred = unet(
+            imgs,
+            torch.tensor([timestep] * batch_size, device=device, dtype=torch.int64),
+            class_labels=eval_labels,
+            return_dict=False
+        )[0]
+
+        # scheduler 更新样本
+        step = scheduler.step(noise_pred, timestep, imgs)
+        imgs = step.prev_sample
+
+    # 5. 转 NumPy 并绘图
+    images_np = imgs.cpu().permute(0, 2, 3, 1).numpy()   # (B, H, W, C)
+    images_tf = images_np.transpose(0, 3, 1, 2)         # (B, C, H, W)
+    plot_tf_trials(images_tf, list(range(batch_size)))
+
 
 
 def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
@@ -183,8 +209,9 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
-        for step, batch in enumerate(train_dataloader):
-            clean_images = batch
+        for step, (clean_images, labels) in enumerate(train_dataloader):
+            clean_images = clean_images.to(device)        # (bs, C, H, W)
+            labels = labels.to(device)       # (bs,)
             # Sample noise to add to the images
             noise = torch.randn(clean_images.shape, device=clean_images.device)
             bs = clean_images.shape[0]
@@ -201,8 +228,12 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                loss = F.mse_loss(noise_pred, noise)
+                noise_pred = model(noisy_images, timesteps, class_labels=labels, return_dict=False)[0]
+                # loss = F.mse_loss(noise_pred, noise)
+                eps = 1e-8
+                mse   = F.mse_loss(noise_pred, noise)
+                power = noise.pow(2).mean()
+                loss  = mse / (power + eps)
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -217,51 +248,36 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
             accelerator.log(logs, step=global_step)
             global_step += 1
 
-        # # After each epoch you optionally sample some demo images with evaluate() and save the model
-        # if accelerator.is_main_process:
-        #     pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
-
-        #     if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-        #         evaluate(config, epoch, pipeline)
-
-        #     if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-        #         if config.push_to_hub:
-        #             upload_folder(
-        #                 repo_id=repo_id,
-        #                 folder_path=config.output_dir,
-        #                 commit_message=f"Epoch {epoch}",
-        #                 ignore_patterns=["step_*", "epoch_*"],
-        #             )
-        #         else:
-        #             pipeline.save_pretrained(config.output_dir)
-
         # 初始化 best loss
         if epoch == 0:
             best_loss = float("inf")
 
-        # 每个 epoch 训练结束后评估是否是最优模型
+        # 每个 epoch 训练结束后主进程执行保存和评估
         if accelerator.is_main_process:
-            pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+            # 1. 解包模型并保存 UNet & scheduler
+            unet = accelerator.unwrap_model(model)
+            save_dir = f"{config.output_dir}/best_model"
+            unet.save_pretrained(save_dir)
+            noise_scheduler.save_pretrained(save_dir)
 
-            # 保存评估图像
+            # 2. 调用 evaluate，传入保存路径
             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                evaluate(config, epoch, pipeline)
+                evaluate(config, epoch, save_dir)
 
-            # 保存 loss 最小时的模型
+            # 3. 根据 avg_loss 决定是否更新最佳模型
             avg_loss = accelerator.gather(torch.tensor(loss.detach().item())).mean().item()
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 print(f"[Epoch {epoch}] New best loss: {best_loss:.6f} — saving model...")
 
+                # 如果你要推到 Hub，也可以 similarly push save_dir
                 if config.push_to_hub:
                     upload_folder(
                         repo_id=repo_id,
-                        folder_path=config.output_dir,
+                        folder_path=save_dir,
                         commit_message=f"Best model at epoch {epoch} (loss={best_loss:.6f})",
                         ignore_patterns=["step_*", "epoch_*"],
                     )
-                else:
-                    pipeline.save_pretrained(f"{config.output_dir}/best_model")
 
 # --------------------------------------------------
 # Start Train

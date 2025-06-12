@@ -19,42 +19,48 @@ block_files = [
 # 1 读取raw EEG并归类
 def load_eeg_data(window_size=1250, step_size=250):
     """
-    加窗切分EEG数据
+    加窗切分EEG数据：先把同一个id的所有trial按时间拼接，再整体滑窗
+
     Args:
         window_size: int, 每个滑动窗口的长度（采样点）
         step_size: int, 每次滑动的步长（采样点）
     Returns:
-        X: ndArray, shape = [num_samples, num_channels, window_size]
-        y: ndArray, shape = [num_samples]
+        X: np.ndarray, shape = [num_samples, num_channels, window_size]
+        y: np.ndarray, shape = [num_samples]
     """
-    sub_dict = {id: [] for id in range(1, 24)}
+    # 按被试ID收集所有trial
+    sub_dict = {sid: [] for sid in range(1, 24)}
     for block_file in block_files:
         with open(block_file, "rb") as f:
             _data: np.ndarray = pickle.load(f)
-        _sig = _data[:-1, :]
-        triggers = _data[-1, :]
+        _sig = _data[:-1, :]       # EEG信号  (channels, time)
+        triggers = _data[-1, :]    # 触发标记
         start_indices = np.where((triggers >= 1) & (triggers <= 23))[0]
         end_indices = np.where(triggers == 241)[0]
         for start, end in zip(start_indices, end_indices):
-            sub_id = int(triggers[start])
-            sub_dict[sub_id].append(_sig[:, start : end + 1])
+            sid = int(triggers[start])
+            sub_dict[sid].append(_sig[:, start:end+1])
 
-    X_list = []
-    y_list = []
-    for id in sub_dict.keys():
-        for trial in sub_dict[id]:
-            num_channels, total_len = trial.shape
-            # 滑窗切分
-            for s in range(0, total_len - window_size + 1, step_size):
-                window = trial[:, s : s + window_size]  # shape: [channels, window_size]
-                if window.shape[1] == window_size:
-                    X_list.append(window)
-                    y_list.append(id)  # 下标从0开始
+    X_list, y_list = [], []
+    # 对每个ID，将所有trial拼接后整体滑窗
+    for sid, trials in sub_dict.items():
+        if not trials:
+            continue
+        # 将该ID所有trial按时间轴拼接
+        concat_sig = np.concatenate(trials, axis=1)  # (channels, total_length)
+        total_len = concat_sig.shape[1]
+        # 滑窗切分
+        for s in range(0, total_len - window_size + 1, step_size):
+            window = concat_sig[:, s:s + window_size]
+            # 保证窗口长度
+            if window.shape[1] == window_size:
+                X_list.append(window)
+                y_list.append(sid)
 
-    X = np.stack(X_list)  # [num_samples, num_channels, window_size]
-    y = np.array(y_list)
+    X = np.stack(X_list, axis=0)  # (num_samples, channels, window_size)
+    y = np.array(y_list, dtype=int)
     print("subid", np.unique(y))
-    print(f"Step1: load and slide aug: X.shape={X.shape}, y.shape={y.shape}")
+    print(f"Step1: concat-by-id and slide window: X.shape={X.shape}, y.shape={y.shape}")
     return X, y
 
 # 2 滤波处理
@@ -162,7 +168,7 @@ def stft_eeg_data(
     return f, t, mag_norm
 
 def get_tf_data():
-    X, y = load_eeg_data(window_size=1250, step_size=250)
+    X, y = load_eeg_data(window_size=1250, step_size=1250)
     # filtered_X = bandpass_filter_eeg(X, sfreq=250, lowcut=4.0, highcut=40.0, order=4)
 
     # 做STFT
@@ -268,7 +274,8 @@ if __name__ == "__main__":
     # 功能3：对比真实数据与生成数据t-sne
     from tsne import compare_generated_with_real_tsne
     # 对比raw EEG
-    generated_data = np.load('generated_data/generated_eeg_200trials.npy')
+    subid = 3
+    generated_data = np.load(f'generated_data/generated_eeg_40trials_sub{subid}.npy')
     real_data, _ = load_eeg_data()
 
     # # 对比tf归一化幅值特征
@@ -276,5 +283,5 @@ if __name__ == "__main__":
     # data = np.load('data/tf_data.npz')
     # real_data = data['X_tf']
 
-    real_data_sub1 = real_data[100:320, :, :]
+    real_data_sub1 = real_data[(subid - 1) * 40: subid * 40, :, :]
     compare_generated_with_real_tsne(generated_data, real_data_sub1)

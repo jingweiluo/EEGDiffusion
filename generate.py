@@ -1,12 +1,13 @@
 import torch
 import numpy as np
-from diffusers import DDPMPipeline
 from scipy.signal import istft
+from diffusers import UNet2DModel, DDPMScheduler
+from tqdm import trange
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def istft_eeg_data(
     stft_coeffs:       np.ndarray,
-    start:             int,
+    subid:             int,
     sfreq:             float,
     nperseg:           int   = 126,
     noverlap:          int   = 106,
@@ -28,6 +29,9 @@ def istft_eeg_data(
 
     # 2. 按实际生成数量切片
     N_gen, C, F, T_w = stft_coeffs.shape
+    N_orig = abs_max.shape[0]
+    trials_per_sub = N_orig // 23
+    start = (subid - 1) * trials_per_sub
     abs_max = abs_max[start:start+N_gen, :, :, :]    # -> (N_gen, C, 1, 1)
     phase   = phase[start:start+N_gen,   :, :, :]    # -> (N_gen, C, F, T_w)
 
@@ -68,29 +72,75 @@ def istft_eeg_data(
     # 6. 返回重建的时域 EEG
     return X_rec
 
+
+@torch.no_grad()  # 1. 关闭梯度
+def generate_tf_from_diffusion(
+    model_dir: str,
+    num_trials: int,
+    seed: int = 42,
+    class_value: int = 3,
+    num_inference_steps: int = 500  # 如果你想少走几步
+) -> np.ndarray:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. 加载 UNet 和 Scheduler，使用 BFloat16
+    unet = UNet2DModel.from_pretrained(
+        model_dir,
+        # torch_dtype=torch.bfloat16  # 4. 半精度
+    ).to(device)
+    scheduler = DDPMScheduler.from_pretrained(model_dir)
+
+    # 2. 切到 eval 模式，启用 attention slicing
+    unet.eval()                                # 2. eval 模式
+
+    # 3. (可选) 少走采样步
+    scheduler.set_timesteps(num_inference_steps)
+
+    # 4. 准备 class_labels
+    eval_labels = torch.full(
+        (num_trials,),
+        fill_value=class_value,
+        device=device,
+        dtype=torch.int64
+    )
+
+    # 5. 计算初始化噪声的 shape
+    sample_size = unet.config.sample_size
+    if isinstance(sample_size, (list, tuple)):
+        H, W = sample_size
+    else:
+        H = W = sample_size
+    shape = (num_trials, unet.config.in_channels, H, W)
+
+    # 6. 随机噪声初始化，并统一类型
+    generator = torch.Generator(device=device).manual_seed(seed)
+    imgs = torch.randn(shape, device=device, generator=generator, dtype=unet.dtype)
+
+    # 7. 反向扩散循环
+    for t in trange(len(scheduler.timesteps), desc="Generating EEG"):
+        step_t = scheduler.timesteps[t]
+        # 模型前向（BFloat16 下也能跑）
+        noise_pred = unet(
+            imgs,
+            torch.full((num_trials,), step_t, device=device),
+            class_labels=eval_labels,
+            return_dict=False
+        )[0]
+        # 更新
+        step = scheduler.step(noise_pred, step_t, imgs)
+        imgs = step.prev_sample
+
+    # 8. 转 NumPy (N, C, H, W) 即 (trial, channel, freq, time)
+    return imgs.cpu().numpy()
+
 # ----------- 主生成函数 -----------
-def generate_eeg_from_diffusion(model_dir: str, num_trials: int, seed: int = 42) -> np.ndarray:
-    # 1. 加载最佳模型
-    pipeline = DDPMPipeline.from_pretrained(f"{model_dir}").to(device)
-
-    # 2. 从噪声中采样生成图像
-    images = pipeline(
-        batch_size=num_trials,
-        generator=torch.Generator(device=device).manual_seed(seed),
-        output_type="np.array"
-    ).images  # shape = (N, H, W, C)
-
-    print("生成图像原始 shape:", images.shape)  # e.g., (N, H, W, 1)
-
-    # 3. 转换为 (N, C, F, T)，即 (trial, channel, frequency, time)
-    images_tensor = torch.from_numpy(images).permute(0, 3, 1, 2).numpy()  # (N, C, H, W)
-
-    # 4. 构造复数系数（假设模值 + 相位为0）
-    X_cwt_fake = images_tensor.astype(np.complex64)
+def generate_eeg_from_tf(tf_np, subid) -> np.ndarray:
+    # 构造复数系数（假设模值 + 相位为0）
+    X_cwt_fake = tf_np.astype(np.complex64)
     # 逆向 ISTFT，重建回 (N, 5, 1250)
     X_eeg = istft_eeg_data(
         X_cwt_fake,
-        start=300, # 使用start:start+generate_num的原始数据的abs_max和phase来生成新数据
+        subid, # 使用start:start+generate_num的原始数据的abs_max和phase来生成新数据
         sfreq=250,
         nperseg=126,
         noverlap=106,
@@ -108,17 +158,21 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, default="results/best_model", help="模型保存目录")
-    parser.add_argument("--num_trials", type=int, default=200, help="要生成的 trial 数量")
+    parser.add_argument("--num_trials", type=int, default=40, help="要生成的 trial 数量")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--subid", type=int, default=1, help="1-23")
 
     args = parser.parse_args()
 
-    eeg_data = generate_eeg_from_diffusion(
+    tf_np = generate_tf_from_diffusion(
         model_dir=args.model_dir,
         num_trials=args.num_trials,
-        seed=args.seed
+        seed=args.seed,
+        class_value=args.subid  # 固定类别索引，可按需修改
     )
 
+    eeg_data = generate_eeg_from_tf(tf_np, args.subid)
+
     # 可选择保存
-    np.save(f"generated_data/generated_eeg_{args.num_trials}trials.npy", eeg_data)
-    print(f"已保存到: {args.model_dir}/generated_eeg_{args.num_trials}trials.npy")
+    np.save(f"generated_data/generated_eeg_{args.num_trials}trials_sub{args.subid}.npy", eeg_data)
+    print(f"已保存到: generated_eeg_{args.num_trials}trials_sub{args.subid}.npy")
