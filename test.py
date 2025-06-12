@@ -1,4 +1,4 @@
-from read_example import plot_cwt_trials
+from read_example import plot_tf_trials
 # --------------------------------------------------
 # Define Training Config
 # --------------------------------------------------
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 @dataclass
 class TrainingConfig:
     # 图像尺寸
-    image_size = (64, 1280)
+    image_size = (64, 64)
     # 训练批次大小
     train_batch_size = 36
     # 评估批次大小 
@@ -51,8 +51,8 @@ preprocess = transforms.Compose([
 def transform_image(img):
     return preprocess(img)
 
-test_data = np.load('data/cwt_data.npz')
-X_cwt = test_data['X_cwt']
+test_data = np.load('data/tf_data.npz')
+X_cwt = test_data['X_tf']
 y = test_data['y']
 
 X_cwt = torch.tensor(X_cwt, dtype=torch.float32)
@@ -97,28 +97,28 @@ model = UNet2DModel(
 # --------------------------------------------------
 # Test Model & visualization
 # --------------------------------------------------
-# from PIL import Image
-# from diffusers import DDPMScheduler
-# import matplotlib.pyplot as plt
+from PIL import Image
+from diffusers import DDPMScheduler
+import matplotlib.pyplot as plt
 
-# sample_channel = 0
-# sample_image = X_train_cwt_norm[0].unsqueeze(0)
-# print("输入sample图像维度：", sample_image.shape)
-# print("输出sample图像维度:", model(sample_image, timestep=0).sample.shape)
+sample_channel = 0
+sample_image = X_train_cwt_norm[0].unsqueeze(0)
+print("输入sample图像维度：", sample_image.shape)
+print("输出sample图像维度:", model(sample_image, timestep=0).sample.shape)
 
-# project_pic_dir = 'C:\\Users\\86136\\Desktop\\毕业设计\\picture'
-# test_noise_steps = 100
+project_pic_dir = 'C:\\Users\\86136\\Desktop\\毕业设计\\picture'
+test_noise_steps = 100
 
-# noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-# noise = torch.randn(sample_image.shape)
-# timesteps = torch.LongTensor([test_noise_steps])
-# noisy_image = noise_scheduler.add_noise(sample_image, noise, timesteps)
+noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+noise = torch.randn(sample_image.shape)
+timesteps = torch.LongTensor([test_noise_steps])
+noisy_image = noise_scheduler.add_noise(sample_image, noise, timesteps)
 
 
-# for i in range(0, 10):
-#     timesteps = torch.LongTensor([test_noise_steps*i])
-#     noisy_image = noise_scheduler.add_noise(sample_image, noise, timesteps)
-#     plot_cwt_trials(noisy_image, [0])
+for i in range(0, 10):
+    timesteps = torch.LongTensor([test_noise_steps*i])
+    noisy_image = noise_scheduler.add_noise(sample_image, noise, timesteps)
+    plot_tf_trials(noisy_image, [0])
 
 
 
@@ -170,146 +170,146 @@ model = UNet2DModel(
 # --------------------------------------------------
 # Train
 # --------------------------------------------------
-import os
-from pathlib import Path
-from accelerate import Accelerator
-from torch.utils.data import DataLoader, Dataset
-import torch.nn.functional as F
+# import os
+# from pathlib import Path
+# from accelerate import Accelerator
+# from torch.utils.data import DataLoader, Dataset
+# import torch.nn.functional as F
 
-from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers import DDPMPipeline
-from diffusers.utils import make_image_grid
-from diffusers import DDPMScheduler
+# from diffusers.optimization import get_cosine_schedule_with_warmup
+# from diffusers import DDPMPipeline
+# from diffusers.utils import make_image_grid
+# from diffusers import DDPMScheduler
 
-from huggingface_hub import create_repo, upload_folder
-from tqdm.auto import tqdm
+# from huggingface_hub import create_repo, upload_folder
+# from tqdm.auto import tqdm
 
-noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-train_dataloader = DataLoader(X_train_cwt_norm, batch_size=config.train_batch_size, shuffle=True)
-optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-lr_scheduler = get_cosine_schedule_with_warmup(
-    optimizer=optimizer,
-    num_warmup_steps=config.lr_warmup_steps,
-    num_training_steps=(len(train_dataloader) * config.num_epochs),
-)
+# noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+# train_dataloader = DataLoader(X_train_cwt_norm, batch_size=config.train_batch_size, shuffle=True)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+# lr_scheduler = get_cosine_schedule_with_warmup(
+#     optimizer=optimizer,
+#     num_warmup_steps=config.lr_warmup_steps,
+#     num_training_steps=(len(train_dataloader) * config.num_epochs),
+# )
 
-def evaluate(config, epoch, pipeline):
-    # 从随机噪声中生成一些图像（这是反向扩散过程）。
-    # 默认的管道输出类型是 `List[torch.Tensor]`
-    # 取sample_channel来展示
-    # print("生成图像......")
+# def evaluate(config, epoch, pipeline):
+#     # 从随机噪声中生成一些图像（这是反向扩散过程）。
+#     # 默认的管道输出类型是 `List[torch.Tensor]`
+#     # 取sample_channel来展示
+#     # print("生成图像......")
 
-    images = pipeline(
-        batch_size=config.eval_batch_size,
-        generator=torch.Generator(device='cpu').manual_seed(config.seed),  # 使用单独的 torch 生成器来避免回绕主训练循环的随机状态
-        output_type="np.array",
-    ).images
+#     images = pipeline(
+#         batch_size=config.eval_batch_size,
+#         generator=torch.Generator(device='cpu').manual_seed(config.seed),  # 使用单独的 torch 生成器来避免回绕主训练循环的随机状态
+#         output_type="np.array",
+#     ).images
 
-    print("生成图像维度：", images.shape)
-    # (batch, height, width, channel)
+#     print("生成图像维度：", images.shape)
+#     # (batch, height, width, channel)
 
-    # 将生成的eval_batch_size个图像拼接成一张大图
-    fig, ax = plt.subplots(2, 10, figsize=(20, 4))
-    for i in range(2):
-        for j in range(10):
-            ax[i, j].imshow(images[i * 10 + j, :, :, sample_channel], aspect='auto')
-            ax[i, j].axis("off")
-            ax[i, j].set_title(f"Image {i * 10 + j}")
+#     # 将生成的eval_batch_size个图像拼接成一张大图
+#     fig, ax = plt.subplots(2, 10, figsize=(20, 4))
+#     for i in range(2):
+#         for j in range(10):
+#             ax[i, j].imshow(images[i * 10 + j, :, :, sample_channel], aspect='auto')
+#             ax[i, j].axis("off")
+#             ax[i, j].set_title(f"Image {i * 10 + j}")
 
-    plt.savefig(f"figs/{epoch:04d}.png", dpi=400)
-    plt.close()
+#     plt.savefig(f"figs/{epoch:04d}.png", dpi=400)
+#     plt.close()
 
 
-def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
-    # Initialize accelerator and tensorboard logging
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        log_with="tensorboard",
-        project_dir=os.path.join(config.output_dir, "logs"),
-    )
-    if accelerator.is_main_process:
-        if config.output_dir is not None:
-            os.makedirs(config.output_dir, exist_ok=True)
-        if config.push_to_hub:
-            repo_id = create_repo(
-                repo_id=config.hub_model_id or Path(config.output_dir).name, exist_ok=True
-            ).repo_id
-        accelerator.init_trackers("train_example")
+# def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
+#     # Initialize accelerator and tensorboard logging
+#     accelerator = Accelerator(
+#         mixed_precision=config.mixed_precision,
+#         gradient_accumulation_steps=config.gradient_accumulation_steps,
+#         log_with="tensorboard",
+#         project_dir=os.path.join(config.output_dir, "logs"),
+#     )
+#     if accelerator.is_main_process:
+#         if config.output_dir is not None:
+#             os.makedirs(config.output_dir, exist_ok=True)
+#         if config.push_to_hub:
+#             repo_id = create_repo(
+#                 repo_id=config.hub_model_id or Path(config.output_dir).name, exist_ok=True
+#             ).repo_id
+#         accelerator.init_trackers("train_example")
 
-    # Prepare everything
-    # There is no specific order to remember, you just need to unpack the
-    # objects in the same order you gave them to the prepare method.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
+#     # Prepare everything
+#     # There is no specific order to remember, you just need to unpack the
+#     # objects in the same order you gave them to the prepare method.
+#     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+#         model, optimizer, train_dataloader, lr_scheduler
+#     )
 
-    global_step = 0
+#     global_step = 0
 
-    # Now you train the model
-    for epoch in range(config.num_epochs):
-        progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
-        progress_bar.set_description(f"Epoch {epoch}")
+#     # Now you train the model
+#     for epoch in range(config.num_epochs):
+#         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+#         progress_bar.set_description(f"Epoch {epoch}")
 
-        for step, batch in enumerate(train_dataloader):
-            clean_images = batch
-            # Sample noise to add to the images
-            noise = torch.randn(clean_images.shape, device=clean_images.device)
-            bs = clean_images.shape[0]
+#         for step, batch in enumerate(train_dataloader):
+#             clean_images = batch
+#             # Sample noise to add to the images
+#             noise = torch.randn(clean_images.shape, device=clean_images.device)
+#             bs = clean_images.shape[0]
 
-            # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device,
-                dtype=torch.int64
-            )
+#             # Sample a random timestep for each image
+#             timesteps = torch.randint(
+#                 0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device,
+#                 dtype=torch.int64
+#             )
 
-            # Add noise to the clean images according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+#             # Add noise to the clean images according to the noise magnitude at each timestep
+#             # (this is the forward diffusion process)
+#             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
-            with accelerator.accumulate(model):
-                # Predict the noise residual
-                noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                loss = F.mse_loss(noise_pred, noise)
-                accelerator.backward(loss)
+#             with accelerator.accumulate(model):
+#                 # Predict the noise residual
+#                 noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+#                 loss = F.mse_loss(noise_pred, noise)
+#                 accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+#                 if accelerator.sync_gradients:
+#                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
+#                 optimizer.step()
+#                 lr_scheduler.step()
+#                 optimizer.zero_grad()
 
-            progress_bar.update(1)
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
-            global_step += 1
+#             progress_bar.update(1)
+#             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+#             progress_bar.set_postfix(**logs)
+#             accelerator.log(logs, step=global_step)
+#             global_step += 1
 
-        # After each epoch you optionally sample some demo images with evaluate() and save the model
-        if accelerator.is_main_process:
-            pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+#         # After each epoch you optionally sample some demo images with evaluate() and save the model
+#         if accelerator.is_main_process:
+#             pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
 
-            if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                evaluate(config, epoch, pipeline)
+#             if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
+#                 evaluate(config, epoch, pipeline)
 
-            if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                if config.push_to_hub:
-                    upload_folder(
-                        repo_id=repo_id,
-                        folder_path=config.output_dir,
-                        commit_message=f"Epoch {epoch}",
-                        ignore_patterns=["step_*", "epoch_*"],
-                    )
-                else:
-                    pipeline.save_pretrained(config.output_dir)
+#             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
+#                 if config.push_to_hub:
+#                     upload_folder(
+#                         repo_id=repo_id,
+#                         folder_path=config.output_dir,
+#                         commit_message=f"Epoch {epoch}",
+#                         ignore_patterns=["step_*", "epoch_*"],
+#                     )
+#                 else:
+#                     pipeline.save_pretrained(config.output_dir)
                     
 
-# --------------------------------------------------
-# Start Train
-# --------------------------------------------------
-from accelerate import notebook_launcher
+# # --------------------------------------------------
+# # Start Train
+# # --------------------------------------------------
+# from accelerate import notebook_launcher
 
-args = (config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
+# args = (config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
 
-notebook_launcher(train_loop, args, num_processes=1)
+# notebook_launcher(train_loop, args, num_processes=1)
 

@@ -1,16 +1,18 @@
-from read_example import plot_cwt_trials
+from read_example import plot_tf_trials
 # --------------------------------------------------
 # Define Training Config
 # --------------------------------------------------
 from dataclasses import dataclass
+import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @dataclass
 class TrainingConfig:
     # 图像尺寸
-    image_size = (64, 1280)
+    image_size = (64, 64)
     # 训练批次大小
     train_batch_size = 8
-    # 评估批次大小 
+    # 评估批次大小
     eval_batch_size = 8
     # 训练轮数
     num_epochs = 60
@@ -20,10 +22,8 @@ class TrainingConfig:
     learning_rate = 1e-4
     # 学习率衰减
     lr_warmup_steps = 500
-    
     save_image_epochs = 5
     save_model_epochs = 20
-    
     mixed_precision = "no"  # `no` for float32, `fp16` for automatic mixed precision
     output_dir = "results"
     # 是否上传模型到HF Hub
@@ -32,7 +32,6 @@ class TrainingConfig:
     hub_private_repo = None
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook
     seed = 42
-    
 config = TrainingConfig()
 
 
@@ -51,16 +50,20 @@ preprocess = transforms.Compose([
 def transform_image(img):
     return preprocess(img)
 
-test_data = np.load('data/cwt_data.npz')
-X_cwt = test_data['X_cwt']
+test_data = np.load('data/tf_data.npz')
+X_tf = test_data['X_tf']
 y = test_data['y']
 
-X_cwt = torch.tensor(X_cwt, dtype=torch.float32)
+X_tf = torch.tensor(X_tf, dtype=torch.float32)
 y = torch.tensor(y, dtype=torch.long)
-print("转换前的维度：", X_cwt.shape)
+print("转换前的维度：", X_tf.shape)
 
-X_train_cwt_norm = transform_image(X_cwt)
-print("转换后的维度：", X_train_cwt_norm.shape)
+# X_tf_resize = transform_image(X_tf)
+# print("转换后的维度：", X_tf_resize.shape)
+X_tf_resize = X_tf
+
+# 【optional】此处可以进行norm操作
+X_tf_resize_norm = X_tf_resize
 
 
 # --------------------------------------------------
@@ -111,7 +114,7 @@ from diffusers import DDPMScheduler
 from huggingface_hub import create_repo, upload_folder
 
 noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-train_dataloader = DataLoader(X_train_cwt_norm, batch_size=config.train_batch_size, shuffle=True)
+train_dataloader = DataLoader(X_tf_resize_norm, batch_size=config.train_batch_size, shuffle=True)
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 lr_scheduler = get_cosine_schedule_with_warmup(
     optimizer=optimizer,
@@ -127,15 +130,15 @@ def evaluate(config, epoch, pipeline):
 
     images = pipeline(
         batch_size=config.eval_batch_size,
-        generator=torch.Generator(device='cpu').manual_seed(config.seed),  # 使用单独的 torch 生成器来避免回绕主训练循环的随机状态
+        generator=torch.Generator(device=device).manual_seed(config.seed),  # 使用单独的 torch 生成器来避免回绕主训练循环的随机状态
         output_type="np.array",
     ).images
 
     print("生成图像维度：", images.shape)
     # (batch, height, width, channel)
     images_transpose = images.transpose(0,3,1,2) # N,C,F,T
-    
-    plot_cwt_trials(images_transpose, list(range(config.eval_batch_size)))
+
+    plot_tf_trials(images_transpose, list(range(config.eval_batch_size)))
 
     # # 将生成的eval_batch_size个图像拼接成一张大图
     # fig, ax = plt.subplots(2, 10, figsize=(20, 4))
@@ -259,7 +262,6 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_s
                     )
                 else:
                     pipeline.save_pretrained(f"{config.output_dir}/best_model")
-                    
 
 # --------------------------------------------------
 # Start Train

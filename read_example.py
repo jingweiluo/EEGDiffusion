@@ -2,7 +2,7 @@ import numpy as np
 import os
 from os.path import dirname, abspath, join
 import pickle
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt, stft
 import pywt
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -54,8 +54,6 @@ def load_eeg_data(window_size=1250, step_size=250):
     X = np.stack(X_list)  # [num_samples, num_channels, window_size]
     y = np.array(y_list)
     print("subid", np.unique(y))
-    # X = torch.tensor(X, dtype=torch.float32)
-    # y = torch.tensor(y, dtype=torch.long)
     print(f"Step1: load and slide aug: X.shape={X.shape}, y.shape={y.shape}")
     return X, y
 
@@ -101,151 +99,94 @@ def bandpass_filter_eeg(eeg_data: np.ndarray,
     print(f"Step2: bandfilter: X.shape={filtered.shape}, filterbands={lowcut}-{highcut}")
     return filtered
 
-# 3 进行CWT处理，提取时频特征
-
-def cwt_eeg_data(eeg_data: np.ndarray,
-                 sfreq: float,
-                 freqs: np.ndarray,
-                 wavelet: str = 'cmor1.5-1.0') -> np.ndarray:
+# 3 stft时频分析
+def stft_eeg_data(
+    eeg_data: np.ndarray,
+    sfreq: float,
+    nperseg: int = 250,
+    noverlap: int = 125,
+    window: str = 'hann'
+):
     """
-    对形状为 (N, C, T) 的 EEG 数据做连续小波变换（CWT）。
-
-    参数:
-        eeg_data: np.ndarray, shape = (N, C, T)，原始 EEG 时域数据
-        sfreq: float，采样频率 (Hz)
-        freqs: np.ndarray, 一维数组，想要分析的频率列表 (Hz)
-        wavelet: str，小波名称（默认为复 Morlet 小波 'cmor1.5-1.0'）
+    对形状为 (N, C, T) 的 EEG 数据做短时傅里叶变换（STFT），
+    并对时频系数做归一化、最后取幅值。
 
     返回:
-        coeffs: np.ndarray, shape = (N, C, F, T)，CWT 系数
-                其中 F = len(freqs)，系数为复数，axis=2 对应不同频率，axis=3 对应时间点
+        f: np.ndarray, shape = (F,), 频率轴
+        t: np.ndarray, shape = (T_w,), 时间帧中心点（秒）
+        coeffs: np.ndarray, shape = (N, C, F, T_w)，归一化后的幅值（float32）
     """
-    # 1. 计算采样周期
-    dt = 1.0 / sfreq
-
-    # 2. 由所给频率计算对应的尺度
-    #    对于给定小波，尺度 a 与频率 f 的近似关系 a = center_freq / (f * dt)
-    center_freq = pywt.central_frequency(wavelet)
-    scales = center_freq / (freqs * dt)
+    if noverlap is None:
+        noverlap = nperseg // 2
 
     N, C, T = eeg_data.shape
-    F = len(scales)
-    coeffs = np.zeros((N, C, F, T), dtype=np.complex64)
 
-    # 3. 将前两维打平，批量处理每条一维信号
-    flat_data = eeg_data.reshape(-1, T)  # 变为 (N*C, T)
+    # 用第一条通道确定输出维度
+    f, t, Z0 = stft(
+        eeg_data[0, 0],
+        fs=sfreq,
+        window=window,
+        nperseg=nperseg,
+        noverlap=noverlap
+    )
+    F, T_w = Z0.shape
 
-    for idx, sig in enumerate(flat_data):
-        # sig: shape (T,)
-        cwt_matrix, _ = pywt.cwt(sig, scales, wavelet, sampling_period=dt)
-        # cwt_matrix: shape (F, T)
-        n = idx // C
-        c = idx % C
-        coeffs[n, c, :, :] = cwt_matrix
+    # 分配复数系数数组
+    coeffs = np.zeros((N, C, F, T_w), dtype=np.complex64)
 
-    print(f"Step3: cwt: X_cwt.shape={coeffs.shape}")
-    return coeffs
+    # 逐 trial、逐通道做 STFT
+    for n in range(N):
+        for c in range(C):
+            _, _, Z = stft(
+                eeg_data[n, c],
+                fs=sfreq,
+                window=window,
+                nperseg=nperseg,
+                noverlap=noverlap
+            )
+            coeffs[n, c] = Z
 
-def get_cwt_data():
+    # 计算幅值与相位
+    mag   = np.abs(coeffs)                  # 幅值
+    phase = np.angle(coeffs)                # 相位信息
+
+    # 归一化
+    abs_max   = np.max(mag,   axis=(2,3), keepdims=True)
+    mag_norm  = (mag / (abs_max + 1e-8)).astype(np.float32)
+
+    # 保存 abs_max 和 phase 到磁盘
+    np.save("abs_max.npy",  abs_max)
+    np.save("phase.npy",    phase)
+
+    print(f"Step3: stft + normalize + magnitude: coeffs.shape={mag_norm.shape}")
+    return f, t, mag_norm
+
+def get_tf_data():
     X, y = load_eeg_data(window_size=1250, step_size=250)
-    filtered_X = bandpass_filter_eeg(X, sfreq=250, lowcut=4.0, highcut=40.0, order=4)
-    freqs = np.linspace(4.0, 40.0, num=50)
-    X_cwt = cwt_eeg_data(filtered_X, sfreq=250, freqs=freqs, wavelet='cmor1.5-1.0')
-    return X_cwt, y
+    # filtered_X = bandpass_filter_eeg(X, sfreq=250, lowcut=4.0, highcut=40.0, order=4)
+
+    # 做STFT
+    f, t, X_tf = stft_eeg_data(
+        X,
+        sfreq=250,
+        nperseg=126,
+        noverlap=106,
+        window='hann',
+    )
+
+    return X_tf, y
 
 # ========================================================可视化==========================================================
-# def plot_cwt_trials(X_cwt: np.ndarray,
-#                     freqs: np.ndarray,
-#                     sfreq: float,
-#                     trial_list: list):
-#     """
-#     在一个图（figure）里，最多显示 5 个 trial 的时频图。若 trial 数量超过 5，只取前 5；
-#     若少于 5，则剩余子图留空，并在最下排标记 x 轴数值。
-
-#     参数:
-#         X_cwt: np.ndarray, shape = (N, C, F, T)，CWT 系数（复数）
-#                N = trial 数量, C = 通道数, F = 频率点数, T = 时间点数
-#         freqs: np.ndarray, shape = (F,)，对应每个尺度的频率 (Hz)
-#         sfreq: float，采样率 (Hz)
-#         trial_list: list of int，要显示的 trial 索引列表（0-based）
-#     """
-#     N, C, F, T = X_cwt.shape
-#     times = np.arange(T) / sfreq        # 时间轴 (秒)
-#     max_display = 5                      # 最多显示 5 个 trial
-
-#     # 保留合法索引，并截取前 5 个
-#     sel = [t for t in trial_list if 0 <= t < N][:max_display]
-#     num_sel = len(sel)
-
-#     # 创建 5×C 的子图网格
-#     fig, axes = plt.subplots(nrows=max_display, ncols=C,
-#                              figsize=(4 * C, 2.5 * max_display),
-#                              sharex=True, sharey=True)
-
-#     # 保证 axes 为 2D 数组
-#     if max_display == 1 and C == 1:
-#         axes = np.array([[axes]])
-#     elif max_display == 1:
-#         axes = axes[np.newaxis, :]
-#     elif C == 1:
-#         axes = axes[:, np.newaxis]
-
-#     # 遍历每一行（对应一个 trial slot）
-#     for row in range(max_display):
-#         if row < num_sel:
-#             trial_idx = sel[row]
-#             coeffs_trial = X_cwt[trial_idx]  # shape = (C, F, T)
-
-#             for ch in range(C):
-#                 ax = axes[row, ch]
-#                 magnitude = np.abs(coeffs_trial[ch])  # shape = (F, T)
-
-#                 im = ax.imshow(
-#                     magnitude,
-#                     aspect='auto',
-#                     origin='lower',
-#                     extent=[times[0], times[-1], freqs[0], freqs[-1]]
-#                 )
-
-#                 # 左边第一列显示 trial 编号
-#                 if ch == 0:
-#                     ax.set_ylabel(f"Trial {trial_idx}", fontsize=10)
-
-#                 # 最上排显示通道编号
-#                 if row == 0:
-#                     ax.set_title(f"Ch {ch}", fontsize=10)
-
-#                 # 最下排显示时间轴标签并标记刻度
-#                 if row == max_display - 1:
-#                     ax.set_xlabel("Time (s)", fontsize=9)
-#                     # 设置 x 轴刻度为 5 个等间隔值
-#                     xticks = np.linspace(times[0], times[-1], num=5)
-#                     ax.set_xticks(xticks)
-#                     ax.set_xticklabels([f"{x:.2f}" for x in xticks])
-#         else:
-#             # 如果没有第 row 个 trial，就隐藏所有对应子图
-#             for ch in range(C):
-#                 axes[row, ch].axis('off')
-
-#     fig.suptitle("Selected Trials: CWT Time–Frequency", fontsize=14, y=0.92)
-#     fig.tight_layout(rect=[0, 0, 1, 0.90])
-
-#     # 保存图片，文件名带时间戳
-#     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-#     fig.savefig(f"figs/cwt_time_frequency_{ts}.png", dpi=300, bbox_inches='tight')
-
-#     plt.show()
-
-def plot_cwt_trials(X_cwt: np.ndarray, trial_list: list):
+def plot_tf_trials(X_tf: np.ndarray, trial_list: list):
     """
     显示任意数量的 trial，每行显示一个 trial 的所有通道（共 C 列），
-    每个单元格为某通道的 CWT 时频图（复数模值）。
+    每个单元格为某通道的时频图（复数模值）。
 
     参数:
-        X_cwt: np.ndarray, shape = (N, C, F, T)
+        X_tf: np.ndarray, shape = (N, C, F, T)
         trial_list: list of int，trial 索引（0-based）
     """
-    N, C, F, T = X_cwt.shape
+    N, C, F, T = X_tf.shape
 
     # 保留合法 trial 索引
     sel = [t for t in trial_list if 0 <= t < N]
@@ -266,7 +207,7 @@ def plot_cwt_trials(X_cwt: np.ndarray, trial_list: list):
 
     for row in range(num_sel):
         trial_idx = sel[row]
-        coeffs_trial = X_cwt[trial_idx]  # shape = (C, F, T)
+        coeffs_trial = X_tf[trial_idx]  # shape = (C, F, T)
 
         for ch in range(C):
             ax = axes[row, ch]
@@ -297,34 +238,43 @@ def plot_cwt_trials(X_cwt: np.ndarray, trial_list: list):
                 ax.set_yticks(np.linspace(0, F - 1, 5, dtype=int))
                 ax.set_yticklabels([str(int(y)) for y in np.linspace(0, F - 1, 5)])
 
-    fig.suptitle("Selected Trials: CWT Magnitude (Index-Based)", fontsize=14, y=0.92)
+    fig.suptitle("Selected Trials: TF Magnitude (Index-Based)", fontsize=14, y=0.92)
     fig.tight_layout(rect=[0, 0, 1, 0.90])
 
     # 保存图片
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fig.savefig(f"figs/cwt_time_frequency_indices_{ts}.png", dpi=300, bbox_inches='tight')
+    fig.savefig(f"figs/time_frequency_indices_{ts}.png", dpi=300, bbox_inches='tight')
 
     plt.show()
 
 if __name__ == "__main__":
-    # # 功能1：生成数据。除非需要改变滑窗，获修改bandfilter、cwt参数，否则直接读取
-    # X_cwt, y = get_cwt_data()
-    # np.savez('data/cwt_data.npz', X_cwt=X_cwt, y=y)
-    
+    # # 功能1：生成数据。除非需要改变滑窗，获修改bandfilter、tf参数，否则直接读取
+    # X_tf, y = get_tf_data()
+    # np.savez('data/tf_data.npz', X_tf=X_tf, y=y)
+
     # # 功能2：绘制时频图
-    # data = np.load('data/cwt_data.npz')
-    # X_cwt = data['X_cwt']
+    # data = np.load('data/tf_data.npz')
+    # X_tf = data['X_tf']
     # y = data['y']
-    
+
     # trials_to_plot_base = [0, 10, 20, 30, 39]
-    # trials_to_plot = [x + 80 for x in trials_to_plot_base]
-    # freqs = np.linspace(4.0, 40.0, num=50)
-    # sfreq = 250
-    # plot_cwt_trials(X_cwt, trials_to_plot)
-    
+    # trials_to_plot = [x + 0 for x in trials_to_plot_base]
+
+    # # X_tf = np.load('generated_data/Tosato_generated_eeg_stft.npy')
+    # # trials_to_plot = [0, 1, 2, 3, 4]
+
+    # plot_tf_trials(X_tf, trials_to_plot)
+
     # 功能3：对比真实数据与生成数据t-sne
     from tsne import compare_generated_with_real_tsne
-    generated_data = np.load('generated_data/generated_eeg_20trials.npy')
+    # 对比raw EEG
+    generated_data = np.load('generated_data/generated_eeg_200trials.npy')
     real_data, _ = load_eeg_data()
-    real_data_sub1 = real_data[:20, :, :]
+
+    # # 对比tf归一化幅值特征
+    # generated_data = np.load('generated_data/generated_tf.npy')
+    # data = np.load('data/tf_data.npz')
+    # real_data = data['X_tf']
+
+    real_data_sub1 = real_data[100:320, :, :]
     compare_generated_with_real_tsne(generated_data, real_data_sub1)

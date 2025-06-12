@@ -47,5 +47,5 @@ def compare_generated_with_real_tsne(generated_data: np.ndarray, real_data: np.n
     plt.ylabel("t-SNE Dim 2")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("tsne_eeg_comparison.png", dpi=300)
+    plt.savefig("figs/tsne_eeg_comparison.png", dpi=300)
     plt.show()
