@@ -17,7 +17,7 @@ block_files = [
 ]
 
 # 1 读取raw EEG并归类
-def load_eeg_data(window_size=1250, step_size=250):
+def load_eeg_data(window_size=1250, step_size=1250):
     """
     加窗切分EEG数据：先把同一个id的所有trial按时间拼接，再整体滑窗
 
@@ -254,9 +254,9 @@ def plot_tf_trials(X_tf: np.ndarray, trial_list: list):
     plt.show()
 
 if __name__ == "__main__":
-    # # 功能1：生成数据。除非需要改变滑窗，获修改bandfilter、tf参数，否则直接读取
-    # X_tf, y = get_tf_data()
-    # np.savez('data/tf_data.npz', X_tf=X_tf, y=y)
+    # 功能1：生成数据。除非需要改变滑窗，获修改bandfilter、tf参数，否则直接读取
+    X_tf, y = get_tf_data()
+    np.savez('data/tf_data.npz', X_tf=X_tf, y=y)
 
     # # 功能2：绘制时频图
     # data = np.load('data/tf_data.npz')
@@ -270,18 +270,3 @@ if __name__ == "__main__":
     # # trials_to_plot = [0, 1, 2, 3, 4]
 
     # plot_tf_trials(X_tf, trials_to_plot)
-
-    # 功能3：对比真实数据与生成数据t-sne
-    from tsne import compare_generated_with_real_tsne
-    # 对比raw EEG
-    subid = 3
-    generated_data = np.load(f'generated_data/generated_eeg_40trials_sub{subid}.npy')
-    real_data, _ = load_eeg_data()
-
-    # # 对比tf归一化幅值特征
-    # generated_data = np.load('generated_data/generated_tf.npy')
-    # data = np.load('data/tf_data.npz')
-    # real_data = data['X_tf']
-
-    real_data_sub1 = real_data[(subid - 1) * 40: subid * 40, :, :]
-    compare_generated_with_real_tsne(generated_data, real_data_sub1)

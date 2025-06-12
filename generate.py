@@ -3,6 +3,7 @@ import numpy as np
 from scipy.signal import istft
 from diffusers import UNet2DModel, DDPMScheduler
 from tqdm import trange
+import pickle
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def istft_eeg_data(
@@ -171,8 +172,29 @@ if __name__ == "__main__":
         class_value=args.subid  # 固定类别索引，可按需修改
     )
 
-    eeg_data = generate_eeg_from_tf(tf_np, args.subid)
+    # 保存单一被试数据
+    # eeg_data = generate_eeg_from_tf(tf_np, args.subid)
+    # np.save(f"generated_data/generated_eeg_{args.num_trials}trials_sub{args.subid}.npy", eeg_data)
+    # print(f"已保存到: generated_eeg_{args.num_trials}trials_sub{args.subid}.npy")
 
-    # 可选择保存
-    np.save(f"generated_data/generated_eeg_{args.num_trials}trials_sub{args.subid}.npy", eeg_data)
-    print(f"已保存到: generated_eeg_{args.num_trials}trials_sub{args.subid}.npy")
+
+
+
+    eeg_dict = {}
+    for sub in trange(1, 24):
+        # 依次为每个子 ID 生成 EEG 时–频数据
+        tf_np = generate_tf_from_diffusion(
+            model_dir=args.model_dir,
+            num_trials=args.num_trials,
+            seed=args.seed,
+            class_value=sub  # 固定类别索引，可按需修改
+        )
+        eeg_data = generate_eeg_from_tf(tf_np, sub)
+        eeg_dict[sub] = eeg_data
+
+    # 把字典保存到磁盘
+    output_path = "generated_data/gen_data_dict.pkl"
+    with open(output_path, "wb") as f:
+        pickle.dump(eeg_dict, f)
+
+    print(f"已保存 23 个子 ID 的生成数据到: {output_path}")
